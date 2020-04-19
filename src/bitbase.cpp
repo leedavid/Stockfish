@@ -1,7 +1,8 @@
 /*
   Stockfish, a UCI chess playing engine derived from Glaurung 2.1
   Copyright (C) 2004-2008 Tord Romstad (Glaurung author)
-  Copyright (C) 2008-2012 Marco Costalba, Joona Kiiski, Tord Romstad
+  Copyright (C) 2008-2015 Marco Costalba, Joona Kiiski, Tord Romstad
+  Copyright (C) 2015-2019 Marco Costalba, Joona Kiiski, Gary Linscott, Tord Romstad
 
   Stockfish is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -18,11 +19,33 @@
 */
 
 #include <cassert>
+#include <numeric>
+#include <vector>
 
 #include "bitboard.h"
 #include "types.h"
 
 namespace {
+
+  // There are 24 possible pawn squares: files A to D and ranks from 2 to 7.
+  // Positions with the pawn on files E to H will be mirrored before probing.
+  constexpr unsigned MAX_INDEX = 2*24*64*64; // stm * psq * wksq * bksq = 196608
+
+  // Each uint32_t stores results of 32 positions, one per bit
+  uint32_t KPKBitbase[MAX_INDEX / 32];
+
+  // A KPK bitbase index is an integer in [0, IndexMax] range
+  //
+  // Information is mapped in a way that minimizes the number of iterations:
+  //
+  // bit  0- 5: white king square (from SQ_A1 to SQ_H8)
+  // bit  6-11: black king square (from SQ_A1 to SQ_H8)
+  // bit    12: side to move (WHITE or BLACK)
+  // bit 13-14: white pawn file (from FILE_A to FILE_D)
+  // bit 15-17: white pawn RANK_7 - rank (from RANK_7 - RANK_7 to RANK_7 - RANK_2)
+  unsigned index(Color us, Square bksq, Square wksq, Square psq) {
+    return wksq | (bksq << 6) | (us << 12) | (file_of(psq) << 13) | ((RANK_7 - rank_of(psq)) << 15);
+  }
 
   enum Result {
     INVALID = 0,
@@ -31,193 +54,127 @@ namespace {
     WIN     = 4
   };
 
-  inline Result& operator|=(Result& r, Result v) { return r = Result(r | v); }
+  Result& operator|=(Result& r, Result v) { return r = Result(r | v); }
 
   struct KPKPosition {
+    KPKPosition() = default;
+    explicit KPKPosition(unsigned idx);
+    operator Result() const { return result; }
+    Result classify(const std::vector<KPKPosition>& db)
+    { return us == WHITE ? classify<WHITE>(db) : classify<BLACK>(db); }
 
-    Result classify_leaf(int idx);
-    Result classify(int idx, Result db[]);
+    template<Color Us> Result classify(const std::vector<KPKPosition>& db);
 
-  private:
-    template<Color Us> Result classify(const Result db[]) const;
-
-    template<Color Us> Bitboard k_attacks() const {
-      return Us == WHITE ? StepAttacksBB[W_KING][wksq] : StepAttacksBB[B_KING][bksq];
-    }
-
-    Bitboard p_attacks() const { return StepAttacksBB[W_PAWN][psq]; }
-    void decode_index(int idx);
-
-    Square wksq, bksq, psq;
-    Color stm;
+    Color us;
+    Square ksq[COLOR_NB], psq;
+    Result result;
   };
 
-  // The possible pawns squares are 24, the first 4 files and ranks from 2 to 7
-  const int IndexMax = 2 * 24 * 64 * 64; // stm * wp_sq * wk_sq * bk_sq = 196608
+} // namespace
 
-  // Each uint32_t stores results of 32 positions, one per bit
-  uint32_t KPKBitbase[IndexMax / 32];
 
-  int index(Square wksq, Square bksq, Square psq, Color stm);
+bool Bitbases::probe(Square wksq, Square wpsq, Square bksq, Color us) {
+
+  assert(file_of(wpsq) <= FILE_D);
+
+  unsigned idx = index(us, bksq, wksq, wpsq);
+  return KPKBitbase[idx / 32] & (1 << (idx & 0x1F));
 }
 
 
-uint32_t probe_kpk_bitbase(Square wksq, Square wpsq, Square bksq, Color stm) {
+void Bitbases::init() {
 
-  int idx = index(wksq, bksq, wpsq, stm);
-  return KPKBitbase[idx / 32] & (1 << (idx & 31));
-}
+  std::vector<KPKPosition> db(MAX_INDEX);
+  unsigned idx, repeat = 1;
 
+  // Initialize db with known win / draw positions
+  for (idx = 0; idx < MAX_INDEX; ++idx)
+      db[idx] = KPKPosition(idx);
 
-void kpk_bitbase_init() {
-
-  Result db[IndexMax];
-  KPKPosition pos;
-  int idx, bit, repeat = 1;
-
-  // Initialize table with known win / draw positions
-  for (idx = 0; idx < IndexMax; idx++)
-      db[idx] = pos.classify_leaf(idx);
-
-  // Iterate until all positions are classified (30 cycles needed)
+  // Iterate through the positions until none of the unknown positions can be
+  // changed to either wins or draws (15 cycles needed).
   while (repeat)
-      for (repeat = idx = 0; idx < IndexMax; idx++)
-          if (db[idx] == UNKNOWN && (db[idx] = pos.classify(idx, db)) != UNKNOWN)
-              repeat = 1;
+      for (repeat = idx = 0; idx < MAX_INDEX; ++idx)
+          repeat |= (db[idx] == UNKNOWN && db[idx].classify(db) != UNKNOWN);
 
-  // Map 32 position results into one KPKBitbase[] entry
-  for (idx = 0; idx < IndexMax / 32; idx++)
-      for (bit = 0; bit < 32; bit++)
-          if (db[32 * idx + bit] == WIN)
-              KPKBitbase[idx] |= 1 << bit;
+  // Map 32 results into one KPKBitbase[] entry
+  for (idx = 0; idx < MAX_INDEX; ++idx)
+      if (db[idx] == WIN)
+          KPKBitbase[idx / 32] |= 1 << (idx & 0x1F);
 }
 
 
 namespace {
 
-  // A KPK bitbase index is an integer in [0, IndexMax] range
-  //
-  // Information is mapped in this way
-  //
-  // bit     0: side to move (WHITE or BLACK)
-  // bit  1- 6: black king square (from SQ_A1 to SQ_H8)
-  // bit  7-12: white king square (from SQ_A1 to SQ_H8)
-  // bit 13-14: white pawn file (from FILE_A to FILE_D)
-  // bit 15-17: white pawn rank - 1 (from RANK_2 - 1 to RANK_7 - 1)
+  KPKPosition::KPKPosition(unsigned idx) {
 
-  int index(Square w, Square b, Square p, Color c) {
-
-    assert(file_of(p) <= FILE_D);
-
-    return c + (b << 1) + (w << 7) + (file_of(p) << 13) + ((rank_of(p) - 1) << 15);
-  }
-
-  void KPKPosition::decode_index(int idx) {
-
-    stm  = Color(idx & 1);
-    bksq = Square((idx >> 1) & 63);
-    wksq = Square((idx >> 7) & 63);
-    psq  = make_square(File((idx >> 13) & 3), Rank((idx >> 15) + 1));
-  }
-
-  Result KPKPosition::classify_leaf(int idx) {
-
-    decode_index(idx);
+    ksq[WHITE] = Square((idx >>  0) & 0x3F);
+    ksq[BLACK] = Square((idx >>  6) & 0x3F);
+    us         = Color ((idx >> 12) & 0x01);
+    psq        = make_square(File((idx >> 13) & 0x3), Rank(RANK_7 - ((idx >> 15) & 0x7)));
 
     // Check if two pieces are on the same square or if a king can be captured
-    if (   wksq == psq || wksq == bksq || bksq == psq
-        || (k_attacks<WHITE>() & bksq)
-        || (stm == WHITE && (p_attacks() & bksq)))
-        return INVALID;
+    if (   distance(ksq[WHITE], ksq[BLACK]) <= 1
+        || ksq[WHITE] == psq
+        || ksq[BLACK] == psq
+        || (us == WHITE && (PawnAttacks[WHITE][psq] & ksq[BLACK])))
+        result = INVALID;
 
-    // The position is an immediate win if it is white to move and the white
-    // pawn can be promoted without getting captured.
-    if (   rank_of(psq) == RANK_7
-        && stm == WHITE
-        && wksq != psq + DELTA_N
-        && (   square_distance(bksq, psq + DELTA_N) > 1
-            ||(k_attacks<WHITE>() & (psq + DELTA_N))))
-        return WIN;
+    // Immediate win if a pawn can be promoted without getting captured
+    else if (   us == WHITE
+             && rank_of(psq) == RANK_7
+             && ksq[us] != psq + NORTH
+             && (    distance(ksq[~us], psq + NORTH) > 1
+                 || (PseudoAttacks[KING][ksq[us]] & (psq + NORTH))))
+        result = WIN;
 
-    // Check for known draw positions
-    //
-    // Case 1: Stalemate
-    if (   stm == BLACK
-        && !(k_attacks<BLACK>() & ~(k_attacks<WHITE>() | p_attacks())))
-        return DRAW;
+    // Immediate draw if it is a stalemate or a king captures undefended pawn
+    else if (   us == BLACK
+             && (  !(PseudoAttacks[KING][ksq[us]] & ~(PseudoAttacks[KING][ksq[~us]] | PawnAttacks[~us][psq]))
+                 || (PseudoAttacks[KING][ksq[us]] & psq & ~PseudoAttacks[KING][ksq[~us]])))
+        result = DRAW;
 
-    // Case 2: King can capture undefended pawn
-    if (   stm == BLACK
-        && (k_attacks<BLACK>() & psq & ~k_attacks<WHITE>()))
-        return DRAW;
-
-    // Case 3: Black king in front of white pawn
-    if (   bksq == psq + DELTA_N
-        && rank_of(psq) < RANK_7)
-        return DRAW;
-
-    //  Case 4: White king in front of pawn and black has opposition
-    if (   stm == WHITE
-        && wksq == psq + DELTA_N
-        && bksq == wksq + DELTA_N + DELTA_N
-        && rank_of(psq) < RANK_5)
-        return DRAW;
-
-    // Case 5: Stalemate with rook pawn
-    if (   bksq == SQ_A8
-        && file_of(psq) == FILE_A)
-        return DRAW;
-
-    return UNKNOWN;
+    // Position will be classified later
+    else
+        result = UNKNOWN;
   }
 
   template<Color Us>
-  Result KPKPosition::classify(const Result db[]) const {
+  Result KPKPosition::classify(const std::vector<KPKPosition>& db) {
 
-    // White to Move: If one move leads to a position classified as RESULT_WIN,
-    // the result of the current position is RESULT_WIN. If all moves lead to
-    // positions classified as RESULT_DRAW, the current position is classified
-    // RESULT_DRAW otherwise the current position is classified as RESULT_UNKNOWN.
+    // White to move: If one move leads to a position classified as WIN, the result
+    // of the current position is WIN. If all moves lead to positions classified
+    // as DRAW, the current position is classified as DRAW, otherwise the current
+    // position is classified as UNKNOWN.
     //
-    // Black to Move: If one move leads to a position classified as RESULT_DRAW,
-    // the result of the current position is RESULT_DRAW. If all moves lead to
-    // positions classified as RESULT_WIN, the position is classified RESULT_WIN.
-    // Otherwise, the current position is classified as RESULT_UNKNOWN.
+    // Black to move: If one move leads to a position classified as DRAW, the result
+    // of the current position is DRAW. If all moves lead to positions classified
+    // as WIN, the position is classified as WIN, otherwise the current position is
+    // classified as UNKNOWN.
+
+    constexpr Color  Them = (Us == WHITE ? BLACK : WHITE);
+    constexpr Result Good = (Us == WHITE ? WIN   : DRAW);
+    constexpr Result Bad  = (Us == WHITE ? DRAW  : WIN);
 
     Result r = INVALID;
-    Bitboard b = k_attacks<Us>();
+    Bitboard b = PseudoAttacks[KING][ksq[Us]];
 
     while (b)
+        r |= Us == WHITE ? db[index(Them, ksq[Them]  , pop_lsb(&b), psq)]
+                         : db[index(Them, pop_lsb(&b), ksq[Them]  , psq)];
+
+    if (Us == WHITE)
     {
-        r |= Us == WHITE ? db[index(pop_1st_bit(&b), bksq, psq, BLACK)]
-                         : db[index(wksq, pop_1st_bit(&b), psq, WHITE)];
+        if (rank_of(psq) < RANK_7)      // Single push
+            r |= db[index(Them, ksq[Them], ksq[Us], psq + NORTH)];
 
-        if (Us == WHITE && (r & WIN))
-            return WIN;
-
-        if (Us == BLACK && (r & DRAW))
-            return DRAW;
+        if (   rank_of(psq) == RANK_2   // Double push
+            && psq + NORTH != ksq[Us]
+            && psq + NORTH != ksq[Them])
+            r |= db[index(Them, ksq[Them], ksq[Us], psq + NORTH + NORTH)];
     }
 
-    if (Us == WHITE && rank_of(psq) < RANK_7)
-    {
-        Square s = psq + DELTA_N;
-        r |= db[index(wksq, bksq, s, BLACK)]; // Single push
-
-        if (rank_of(s) == RANK_3 && s != wksq && s != bksq)
-            r |= db[index(wksq, bksq, s + DELTA_N, BLACK)]; // Double push
-
-        if (r & WIN)
-            return WIN;
-    }
-
-    return r & UNKNOWN ? UNKNOWN : Us == WHITE ? DRAW : WIN;
+    return result = r & Good  ? Good  : r & UNKNOWN ? UNKNOWN : Bad;
   }
 
-  Result KPKPosition::classify(int idx, Result db[]) {
-
-    decode_index(idx);
-    return stm == WHITE ? classify<WHITE>(db) : classify<BLACK>(db);
-  }
-
-}
+} // namespace

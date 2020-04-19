@@ -1,7 +1,8 @@
 /*
   Stockfish, a UCI chess playing engine derived from Glaurung 2.1
   Copyright (C) 2004-2008 Tord Romstad (Glaurung author)
-  Copyright (C) 2008-2012 Marco Costalba, Joona Kiiski, Tord Romstad
+  Copyright (C) 2008-2015 Marco Costalba, Joona Kiiski, Tord Romstad
+  Copyright (C) 2015-2019 Marco Costalba, Joona Kiiski, Gary Linscott, Tord Romstad
 
   Stockfish is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -17,85 +18,138 @@
   along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#if defined(_WIN32) || defined(_WIN64)
+#ifdef _WIN32
+#if _WIN32_WINNT < 0x0601
+#undef  _WIN32_WINNT
+#define _WIN32_WINNT 0x0601 // Force to include needed API prototypes
+#endif
 
-#define _CRT_SECURE_NO_DEPRECATE
-#define NOMINMAX // disable macros min() and max()
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include <windows.h>
-#include <sys/timeb.h>
-
-#else
-
-#  include <sys/time.h>
-#  include <sys/types.h>
-#  include <unistd.h>
-#  if defined(__hpux)
-#     include <sys/pstat.h>
-#  endif
-
+// The needed Windows API for processor groups could be missed from old Windows
+// versions, so instead of calling them directly (forcing the linker to resolve
+// the calls at compile time), try to load them at runtime. To do this we need
+// first to define the corresponding function pointers.
+extern "C" {
+typedef bool(*fun1_t)(LOGICAL_PROCESSOR_RELATIONSHIP,
+                      PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, PDWORD);
+typedef bool(*fun2_t)(USHORT, PGROUP_AFFINITY);
+typedef bool(*fun3_t)(HANDLE, CONST GROUP_AFFINITY*, PGROUP_AFFINITY);
+}
 #endif
 
-#if !defined(NO_PREFETCH)
-#  include <xmmintrin.h>
-#endif
-
-#include <algorithm>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <vector>
 
 #include "misc.h"
 #include "thread.h"
 
 using namespace std;
 
-/// Version number. If Version is left empty, then Tag plus current
-/// date (in the format YYMMDD) is used as a version number.
+namespace {
 
-static const string Version = "";
-static const string Tag = "";
+/// Version number. If Version is left empty, then compile date in the format
+/// DD-MM-YY and show in engine_info.
+const string Version = "";
 
+/// Our fancy logging facility. The trick here is to replace cin.rdbuf() and
+/// cout.rdbuf() with two Tie objects that tie cin and cout to a file stream. We
+/// can toggle the logging of std::cout and std:cin at runtime whilst preserving
+/// usual I/O functionality, all without changing a single line of code!
+/// Idea from http://groups.google.com/group/comp.lang.c++/msg/1d941c0f26ea0d81
 
-/// engine_info() returns the full name of the current Stockfish version.
-/// This will be either "Stockfish YYMMDD" (where YYMMDD is the date when
-/// the program was compiled) or "Stockfish <version number>", depending
-/// on whether Version is empty.
+struct Tie: public streambuf { // MSVC requires split streambuf for cin and cout
+
+  Tie(streambuf* b, streambuf* l) : buf(b), logBuf(l) {}
+
+  int sync() override { return logBuf->pubsync(), buf->pubsync(); }
+  int overflow(int c) override { return log(buf->sputc((char)c), "<< "); }
+  int underflow() override { return buf->sgetc(); }
+  int uflow() override { return log(buf->sbumpc(), ">> "); }
+
+  streambuf *buf, *logBuf;
+
+  int log(int c, const char* prefix) {
+
+    static int last = '\n'; // Single log file
+
+    if (last == '\n')
+        logBuf->sputn(prefix, 3);
+
+    return last = logBuf->sputc((char)c);
+  }
+};
+
+class Logger {
+
+  Logger() : in(cin.rdbuf(), file.rdbuf()), out(cout.rdbuf(), file.rdbuf()) {}
+ ~Logger() { start(""); }
+
+  ofstream file;
+  Tie in, out;
+
+public:
+  static void start(const std::string& fname) {
+
+    static Logger l;
+
+    if (!fname.empty() && !l.file.is_open())
+    {
+        l.file.open(fname, ifstream::out);
+        cin.rdbuf(&l.in);
+        cout.rdbuf(&l.out);
+    }
+    else if (fname.empty() && l.file.is_open())
+    {
+        cout.rdbuf(l.out.buf);
+        cin.rdbuf(l.in.buf);
+        l.file.close();
+    }
+  }
+};
+
+} // namespace
+
+/// engine_info() returns the full name of the current Stockfish version. This
+/// will be either "Stockfish <Tag> DD-MM-YY" (where DD-MM-YY is the date when
+/// the program was compiled) or "Stockfish <Version>", depending on whether
+/// Version is empty.
 
 const string engine_info(bool to_uci) {
 
   const string months("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec");
-  const string cpu64(Is64Bit ? " 64bit" : "");
-  const string popcnt(HasPopCnt ? " SSE4.2" : "");
-
   string month, day, year;
-  stringstream s, date(__DATE__); // From compiler, format is "Sep 21 2008"
+  stringstream ss, date(__DATE__); // From compiler, format is "Sep 21 2008"
+
+  ss << "Stockfish " << Version << setfill('0');
 
   if (Version.empty())
   {
       date >> month >> day >> year;
-
-      s << "Stockfish " << Tag
-        << setfill('0') << " " << year.substr(2)
-        << setw(2) << (1 + months.find(month) / 4)
-        << setw(2) << day << cpu64 << popcnt;
+      ss << setw(2) << day << setw(2) << (1 + months.find(month) / 4) << year.substr(2);
   }
-  else
-      s << "Stockfish " << Version << cpu64 << popcnt;
 
-  s << (to_uci ? "\nid author ": " by ")
-    << "Tord Romstad, Marco Costalba and Joona Kiiski";
+  ss << (Is64Bit ? " 64" : "")
+     << (HasPext ? " BMI2" : (HasPopCnt ? " POPCNT" : ""))
+     << (to_uci  ? "\nid author ": " by ")
+     << "T. Romstad, M. Costalba, J. Kiiski, G. Linscott";
 
-  return s.str();
+  return ss.str();
 }
 
 
 /// Debug functions used mainly to collect run-time statistics
+static std::atomic<int64_t> hits[2], means[2];
 
-static uint64_t hits[2], means[2];
-
-void dbg_hit_on(bool b) { hits[0]++; if (b) hits[1]++; }
-void dbg_hit_on_c(bool c, bool b) { if (c) dbg_hit_on(b); }
-void dbg_mean_of(int v) { means[0]++; means[1] += v; }
+void dbg_hit_on(bool b) { ++hits[0]; if (b) ++hits[1]; }
+void dbg_hit_on(bool c, bool b) { if (c) dbg_hit_on(b); }
+void dbg_mean_of(int v) { ++means[0]; means[1] += v; }
 
 void dbg_print() {
 
@@ -105,97 +159,159 @@ void dbg_print() {
 
   if (means[0])
       cerr << "Total " << means[0] << " Mean "
-           << (float)means[1] / means[0] << endl;
+           << (double)means[1] / means[0] << endl;
 }
 
 
-/// system_time() returns the current system time, measured in milliseconds
+/// Used to serialize access to std::cout to avoid multiple threads writing at
+/// the same time.
 
-int system_time() {
+std::ostream& operator<<(std::ostream& os, SyncCout sc) {
 
-#if defined(_WIN32) || defined(_WIN64)
-  struct _timeb t;
-  _ftime(&t);
-  return int(t.time * 1000 + t.millitm);
-#else
-  struct timeval t;
-  gettimeofday(&t, NULL);
-  return t.tv_sec * 1000 + t.tv_usec / 1000;
-#endif
+  static Mutex m;
+
+  if (sc == IO_LOCK)
+      m.lock();
+
+  if (sc == IO_UNLOCK)
+      m.unlock();
+
+  return os;
 }
 
 
-/// cpu_count() tries to detect the number of CPU cores
-
-int cpu_count() {
-
-#if defined(_WIN32) || defined(_WIN64)
-  SYSTEM_INFO s;
-  GetSystemInfo(&s);
-  return std::min(int(s.dwNumberOfProcessors), MAX_THREADS);
-#else
-
-#  if defined(_SC_NPROCESSORS_ONLN)
-  return std::min((int)sysconf(_SC_NPROCESSORS_ONLN), MAX_THREADS);
-#  elif defined(__hpux)
-  struct pst_dynamic psd;
-  if (pstat_getdynamic(&psd, sizeof(psd), (size_t)1, 0) == -1)
-      return 1;
-  return std::min((int)psd.psd_proc_cnt, MAX_THREADS);
-#  else
-  return 1;
-#  endif
-
-#endif
-}
+/// Trampoline helper to avoid moving Logger to misc.h
+void start_logger(const std::string& fname) { Logger::start(fname); }
 
 
-/// timed_wait() waits for msec milliseconds. It is mainly an helper to wrap
-/// conversion from milliseconds to struct timespec, as used by pthreads.
+/// prefetch() preloads the given address in L1/L2 cache. This is a non-blocking
+/// function that doesn't stall the CPU waiting for data to be loaded from memory,
+/// which can be quite slow.
+#ifdef NO_PREFETCH
 
-void timed_wait(WaitCondition& sleepCond, Lock& sleepLock, int msec) {
-
-#if defined(_WIN32) || defined(_WIN64)
-  int tm = msec;
-#else
-  struct timeval t;
-  struct timespec abstime, *tm = &abstime;
-
-  gettimeofday(&t, NULL);
-
-  abstime.tv_sec = t.tv_sec + (msec / 1000);
-  abstime.tv_nsec = (t.tv_usec + (msec % 1000) * 1000) * 1000;
-
-  if (abstime.tv_nsec > 1000000000LL)
-  {
-      abstime.tv_sec += 1;
-      abstime.tv_nsec -= 1000000000LL;
-  }
-#endif
-
-  cond_timedwait(sleepCond, sleepLock, tm);
-}
-
-
-/// prefetch() preloads the given address in L1/L2 cache. This is a non
-/// blocking function and do not stalls the CPU waiting for data to be
-/// loaded from memory, that can be quite slow.
-#if defined(NO_PREFETCH)
-
-void prefetch(char*) {}
+void prefetch(void*) {}
 
 #else
 
-void prefetch(char* addr) {
+void prefetch(void* addr) {
 
-#  if defined(__INTEL_COMPILER) || defined(__ICL)
-   // This hack prevents prefetches to be optimized away by
-   // Intel compiler. Both MSVC and gcc seems not affected.
+#  if defined(__INTEL_COMPILER)
+   // This hack prevents prefetches from being optimized away by
+   // Intel compiler. Both MSVC and gcc seem not be affected by this.
    __asm__ ("");
 #  endif
 
-  _mm_prefetch(addr, _MM_HINT_T2);
-  _mm_prefetch(addr+64, _MM_HINT_T2); // 64 bytes ahead
+#  if defined(__INTEL_COMPILER) || defined(_MSC_VER)
+  _mm_prefetch((char*)addr, _MM_HINT_T0);
+#  else
+  __builtin_prefetch(addr);
+#  endif
 }
 
 #endif
+
+namespace WinProcGroup {
+
+#ifndef _WIN32
+
+void bindThisThread(size_t) {}
+
+#else
+
+/// best_group() retrieves logical processor information using Windows specific
+/// API and returns the best group id for the thread with index idx. Original
+/// code from Texel by Peter Österlund.
+
+int best_group(size_t idx) {
+
+  int threads = 0;
+  int nodes = 0;
+  int cores = 0;
+  DWORD returnLength = 0;
+  DWORD byteOffset = 0;
+
+  // Early exit if the needed API is not available at runtime
+  HMODULE k32 = GetModuleHandle("Kernel32.dll");
+  auto fun1 = (fun1_t)(void(*)())GetProcAddress(k32, "GetLogicalProcessorInformationEx");
+  if (!fun1)
+      return -1;
+
+  // First call to get returnLength. We expect it to fail due to null buffer
+  if (fun1(RelationAll, nullptr, &returnLength))
+      return -1;
+
+  // Once we know returnLength, allocate the buffer
+  SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *buffer, *ptr;
+  ptr = buffer = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)malloc(returnLength);
+
+  // Second call, now we expect to succeed
+  if (!fun1(RelationAll, buffer, &returnLength))
+  {
+      free(buffer);
+      return -1;
+  }
+
+  while (byteOffset < returnLength)
+  {
+      if (ptr->Relationship == RelationNumaNode)
+          nodes++;
+
+      else if (ptr->Relationship == RelationProcessorCore)
+      {
+          cores++;
+          threads += (ptr->Processor.Flags == LTP_PC_SMT) ? 2 : 1;
+      }
+
+      assert(ptr->Size);
+      byteOffset += ptr->Size;
+      ptr = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)(((char*)ptr) + ptr->Size);
+  }
+
+  free(buffer);
+
+  std::vector<int> groups;
+
+  // Run as many threads as possible on the same node until core limit is
+  // reached, then move on filling the next node.
+  for (int n = 0; n < nodes; n++)
+      for (int i = 0; i < cores / nodes; i++)
+          groups.push_back(n);
+
+  // In case a core has more than one logical processor (we assume 2) and we
+  // have still threads to allocate, then spread them evenly across available
+  // nodes.
+  for (int t = 0; t < threads - cores; t++)
+      groups.push_back(t % nodes);
+
+  // If we still have more threads than the total number of logical processors
+  // then return -1 and let the OS to decide what to do.
+  return idx < groups.size() ? groups[idx] : -1;
+}
+
+
+/// bindThisThread() set the group affinity of the current thread
+
+void bindThisThread(size_t idx) {
+
+  // Use only local variables to be thread-safe
+  int group = best_group(idx);
+
+  if (group == -1)
+      return;
+
+  // Early exit if the needed API are not available at runtime
+  HMODULE k32 = GetModuleHandle("Kernel32.dll");
+  auto fun2 = (fun2_t)(void(*)())GetProcAddress(k32, "GetNumaNodeProcessorMaskEx");
+  auto fun3 = (fun3_t)(void(*)())GetProcAddress(k32, "SetThreadGroupAffinity");
+
+  if (!fun2 || !fun3)
+      return;
+
+  GROUP_AFFINITY affinity;
+  if (fun2(group, &affinity))
+      fun3(GetCurrentThread(), &affinity, nullptr);
+}
+
+#endif
+
+} // namespace WinProcGroup
